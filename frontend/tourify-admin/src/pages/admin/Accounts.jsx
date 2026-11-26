@@ -1,0 +1,876 @@
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import AdminLayout from '../../components/AdminLayout';
+import '../../styles/AdminDashboard.css';
+import {
+  fetchAdminStaffProfiles,
+  fetchAllEstablishments,
+  createLguAdmin,
+  fetchMunicipalities,
+  updateLguAdminStatus,
+  createBtoStaff
+} from '../../services/btoApi';
+import { useActionStatus } from '../../context/ActionStatusContext';
+
+const accountTabs = [
+  { id: 'all', label: 'All Accounts' },
+  { id: 'lgu_admin', label: 'LGU Admins' },
+  { id: 'bto_staff', label: 'BTO Staff' },
+  { id: 'lgu_staff', label: 'LGU Staff' },
+  { id: 'business_establishment', label: 'Establishment Owners' },
+];
+
+const initialAdminForm = {
+  fullName: '',
+  username: '',
+  email: '',
+  municipalityId: '',
+  phone: '',
+  notes: '',
+};
+
+const initialBtoStaffForm = {
+  fullName: '',
+  username: '',
+  email: '',
+};
+
+const LAST_ACTIVE_LGU_ADMIN_MESSAGE =
+  'At least one LGU admin account must remain active in this municipality.';
+
+function Accounts() {
+  const [activeTab, setActiveTab] = useState('all');
+  const [adminForm, setAdminForm] = useState(initialAdminForm);
+  const [isModalOpen, setModalOpen] = useState(false);
+
+  const [staff, setStaff] = useState([]);
+  const [loadingStaff, setLoadingStaff] = useState(true);
+  const [staffError, setStaffError] = useState('');
+  const [establishments, setEstablishments] = useState([]);
+
+  const [municipalities, setMunicipalities] = useState([]);
+  const [loadingMunicipalities, setLoadingMunicipalities] = useState(true);
+
+  const [isBtoStaffModalOpen, setBtoStaffModalOpen] = useState(false);
+  const [btoStaffForm, setBtoStaffForm] = useState(initialBtoStaffForm);
+  const [submittingBtoStaff, setSubmittingBtoStaff] = useState(false);
+
+
+  const pageSize = 10;
+  const [page, setPage] = useState(1);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [ownerRegistrationFilter, setOwnerRegistrationFilter] = useState('all');
+
+
+  const [submittingAdmin, setSubmittingAdmin] = useState(false);
+  const { showLoading, showSuccess, showError } = useActionStatus();
+
+  const [statusModal, setStatusModal] = useState({
+    open: false,
+    target: null,
+    nextState: true,
+    loading: false,
+    error: '',
+  });
+
+  const normalizeMunicipalities = (raw) => {
+    if (Array.isArray(raw)) return raw;
+    if (Array.isArray(raw?.items)) return raw.items;
+    if (Array.isArray(raw?.data)) return raw.data;
+    if (Array.isArray(raw?.municipalities)) return raw.municipalities;
+    if (raw && typeof raw === 'object') {
+      return Object.values(raw);
+    }
+    return [];
+  };
+
+  const formatDateTime = (value) => {
+    if (!value) return '-';
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? '-' : date.toLocaleString();
+  };
+
+
+  const loadData = useCallback(async () => {
+    try {
+      setLoadingStaff(true);
+      setLoadingMunicipalities(true);
+
+      const loadAllEstablishments = async () => {
+        const limit = 100;
+        let pageNum = 1;
+        let total = 0;
+        const allItems = [];
+
+        while (pageNum <= 200) {
+          const { data } = await fetchAllEstablishments({ page: pageNum, limit });
+          const items = Array.isArray(data?.items)
+            ? data.items
+            : Array.isArray(data)
+            ? data
+            : [];
+
+          allItems.push(...items);
+          if (!Array.isArray(data?.items)) break;
+
+          total = Number(data?.total) || allItems.length;
+          if (!items.length || allItems.length >= total) break;
+          pageNum += 1;
+        }
+
+        return allItems;
+      };
+
+      const [staffRes, municipalitiesRes, establishmentsRes] = await Promise.all([
+        fetchAdminStaffProfiles(),
+        fetchMunicipalities(),
+        loadAllEstablishments(),
+      ]);
+
+      setStaff(staffRes.data?.staff || []);
+      setEstablishments(establishmentsRes || []);
+      setMunicipalities(normalizeMunicipalities(municipalitiesRes?.data));
+      setStaffError('');
+    } catch (error) {
+      console.error('Failed to load accounts', error);
+      setStaffError('Unable to load accounts right now.');
+    } finally {
+      setLoadingStaff(false);
+      setLoadingMunicipalities(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  const accounts = useMemo(
+    () =>
+      staff.map(({ account, profile }) => {
+        const isActive = account.is_active !== false;
+        return {
+          id: account.account_id,
+          name: profile?.full_name ?? account.email,
+          email: account.email,
+          username: account.username || '',
+          municipalityId: profile?.municipality_id ?? '',
+          municipality: profile?.municipality_id ?? 'Not assigned',
+          profileId: profile?.business_establishment_profile_id ?? null,
+          roleId: account.role,
+          role:
+            account.role === 'lgu_admin'
+              ? 'LGU Admin'
+              : account.role === 'lgu_staff'
+              ? 'LGU Staff'
+              : account.role === 'bto_staff'
+              ? 'BTO Staff'
+              : account.role === 'business_establishment'
+              ? 'Establishment Owner'
+              : account.role,
+          status: isActive ? 'Active' : 'Deactivated',
+          isActive,
+          lastSeen: account.updatedAt
+            ? new Date(account.updatedAt).toLocaleString()
+            : '-',
+          createdAt: account.createdAt,
+          updatedAt: account.updatedAt,
+        };
+      }),
+    [staff],
+  );
+
+  const registeredOwnerProfileIds = useMemo(
+    () =>
+      new Set(
+        establishments
+          .map((item) => item?.business_establishment_profile_id)
+          .filter(Boolean),
+      ),
+    [establishments],
+  );
+
+  const roleCounts = useMemo(
+    () =>
+      accounts.reduce(
+        (acc, account) => {
+          const key = account.roleId || 'unknown';
+          acc.all += 1;
+          acc[key] = (acc[key] || 0) + 1;
+          return acc;
+        },
+        { all: 0 },
+      ),
+    [accounts],
+  );
+
+  const ownerRegistrationCounts = useMemo(() => {
+    const owners = accounts.filter((account) => account.roleId === 'business_establishment');
+    const registered = owners.filter(
+      (account) => account.profileId && registeredOwnerProfileIds.has(account.profileId),
+    ).length;
+    return {
+      all: owners.length,
+      registered,
+      unregistered: Math.max(0, owners.length - registered),
+    };
+  }, [accounts, registeredOwnerProfileIds]);
+
+  const filteredAccounts = useMemo(() => {
+    const roleFiltered =
+      activeTab === 'all'
+        ? accounts
+        : accounts.filter((account) => account.roleId === activeTab);
+
+    const ownerFiltered =
+      activeTab === 'business_establishment' && ownerRegistrationFilter !== 'all'
+        ? roleFiltered.filter((account) => {
+            const isRegistered = Boolean(
+              account.profileId && registeredOwnerProfileIds.has(account.profileId),
+            );
+            return ownerRegistrationFilter === 'registered' ? isRegistered : !isRegistered;
+          })
+        : roleFiltered;
+
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return ownerFiltered;
+
+    return ownerFiltered.filter((account) =>
+      [
+        account.name,
+        account.email,
+        account.username,
+        account.municipality,
+        account.role,
+        account.id,
+      ]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(query)),
+    );
+  }, [accounts, activeTab, ownerRegistrationFilter, registeredOwnerProfileIds, searchQuery]);
+
+  useEffect(() => setPage(1), [activeTab, searchQuery, ownerRegistrationFilter]);
+
+  useEffect(() => {
+    const max = Math.max(1, Math.ceil(filteredAccounts.length / pageSize) || 1);
+    setPage((prev) => Math.min(prev, max));
+  }, [filteredAccounts.length]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredAccounts.length / pageSize));
+  const paginatedAccounts = useMemo(
+    () => filteredAccounts.slice((page - 1) * pageSize, page * pageSize),
+    [filteredAccounts, page],
+  );
+  const pageStart = filteredAccounts.length ? (page - 1) * pageSize + 1 : 0;
+  const pageEnd = Math.min(page * pageSize, filteredAccounts.length);
+
+
+  const activeTabMeta = accountTabs.find((tab) => tab.id === activeTab);
+  const currentCount =
+    activeTab === 'all' ? roleCounts.all : roleCounts[activeTab] || 0;
+
+  const isLastActiveLguAdminInMunicipality = (targetAccount) => {
+    if (
+      !targetAccount ||
+      targetAccount.roleId !== 'lgu_admin' ||
+      targetAccount.isActive !== true
+    ) {
+      return false;
+    }
+
+    const activeLguAdminsInMunicipality = accounts.filter(
+      (account) =>
+        account.roleId === 'lgu_admin' &&
+        account.isActive === true &&
+        account.municipalityId === targetAccount.municipalityId,
+    );
+
+    return activeLguAdminsInMunicipality.length <= 1;
+  };
+
+  const openModal = () => {
+    setAdminForm(initialAdminForm);
+    setModalOpen(true);
+  };
+
+  const closeModal = () => {
+    setModalOpen(false);
+  };
+
+  const handleAdminFormChange = (event) => {
+    const { name, value } = event.target;
+    setAdminForm((prev) => ({
+      ...prev,
+      [name]: value,
+    }));
+  };
+
+  const handleCreateAdmin = async (event) => {
+    event.preventDefault();
+    setSubmittingAdmin(true);
+    showLoading('Creating LGU admin account...');
+
+    try {
+      await createLguAdmin({
+        username: adminForm.username,
+        email: adminForm.email,
+        full_name: adminForm.fullName,
+        municipality_id: adminForm.municipalityId,
+      });
+
+      showSuccess('LGU admin ' + adminForm.fullName + ' has been created.');
+
+      setAdminForm(initialAdminForm);
+      setModalOpen(false);
+      await loadData();
+    } catch (error) {
+      showError(error.response?.data?.message || 'Unable to create LGU admin. Please try again.');
+    } finally {
+      setSubmittingAdmin(false);
+    }
+  };
+
+  const openBtoStaffModal = () => {
+  setBtoStaffForm(initialBtoStaffForm);
+  setBtoStaffModalOpen(true);
+};
+
+const closeBtoStaffModal = () => {
+  setBtoStaffModalOpen(false);
+};
+
+const handleBtoStaffFormChange = (event) => {
+  const { name, value } = event.target;
+  setBtoStaffForm((prev) => ({ ...prev, [name]: value }));
+};
+
+const handleCreateBtoStaff = async (event) => {
+  event.preventDefault();
+  setSubmittingBtoStaff(true);
+  showLoading('Creating BTO staff account...');
+
+  try {
+    await createBtoStaff({
+      username: btoStaffForm.username,
+      email: btoStaffForm.email,
+      full_name: btoStaffForm.fullName,
+    });
+
+    showSuccess('BTO staff ' + btoStaffForm.fullName + ' has been created.');
+
+    setBtoStaffForm(initialBtoStaffForm);
+    setBtoStaffModalOpen(false);
+    await loadData();
+  } catch (error) {
+    showError(error.response?.data?.message || 'Unable to create BTO staff. Please try again.');
+  } finally {
+    setSubmittingBtoStaff(false);
+  }
+};
+
+  const openStatusModalForAccount = (account, nextState) => {
+    const isBlockedDeactivation =
+      nextState === false && isLastActiveLguAdminInMunicipality(account);
+
+    setStatusModal({
+      open: true,
+      target: account,
+      nextState,
+      loading: false,
+      error: isBlockedDeactivation ? LAST_ACTIVE_LGU_ADMIN_MESSAGE : '',
+    });
+  };
+
+  const closeStatusModal = () => {
+    setStatusModal({
+      open: false,
+      target: null,
+      nextState: true,
+      loading: false,
+      error: '',
+    });
+  };
+
+  const handleStatusSubmit = async () => {
+    if (!statusModal.target) return;
+
+    if (
+      statusModal.nextState === false &&
+      isLastActiveLguAdminInMunicipality(statusModal.target)
+    ) {
+      setStatusModal((prev) => ({
+        ...prev,
+        loading: false,
+        error: LAST_ACTIVE_LGU_ADMIN_MESSAGE,
+      }));
+      return;
+    }
+
+    setStatusModal((prev) => ({ ...prev, loading: true, error: '' }));
+    showLoading('Updating account status...');
+    try {
+      await updateLguAdminStatus(statusModal.target.id, statusModal.nextState);
+      setStatusModal({
+        open: false,
+        target: null,
+        nextState: true,
+        loading: false,
+        error: '',
+      });
+      showSuccess('LGU admin ' + statusModal.target.name + ' has been ' + (statusModal.nextState ? 'reactivated' : 'deactivated') + '.');
+      await loadData();
+    } catch (error) {
+      setStatusModal((prev) => ({
+        ...prev,
+        loading: false,
+        error:
+          error.response?.data?.message ||
+          'Unable to update account status. Please try again.',
+        }));
+    }
+  };
+
+  const statusActionBlocked =
+    statusModal.open &&
+    statusModal.nextState === false &&
+    isLastActiveLguAdminInMunicipality(statusModal.target);
+
+  return (
+    <AdminLayout
+      title="Accounts"
+      subtitle="Manage LGU, BTO, and establishment owner accounts province-wide."
+        headerActions={
+          <div style={{ display: 'flex', gap: '0.5rem' }}>
+            <button type="button" className="primary-cta" onClick={openModal}>
+              Create LGU Admin
+            </button>
+            <button type="button" className="ghost-cta" onClick={openBtoStaffModal}>
+              Create BTO Staff
+            </button>
+          </div>
+        }
+    >
+      <section className="account-management">
+        <div className="section-heading">
+          <h2>Accounts</h2>
+          <p>
+            Showing {filteredAccounts.length} of {currentCount}{' '}
+            {activeTabMeta ? activeTabMeta.label.toLowerCase() : 'accounts'}.
+          </p>
+        </div>
+
+        <div className="account-controls">
+          <div className="tab-group">
+            {accountTabs.map((tab) => (
+              <button
+                type="button"
+                key={tab.id}
+                className={`tab-button ${activeTab === tab.id ? 'active' : ''}`}
+                onClick={() => setActiveTab(tab.id)}
+              >
+                {tab.label}
+                <span className="tab-count">
+                  {tab.id === 'all' ? roleCounts.all : roleCounts[tab.id] || 0}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="est-filter-bar">
+          <label className="est-filter-item est-filter-item--search">
+            <span>Search account</span>
+            <input
+              type="search"
+              placeholder="Search by name, username, email, municipality or ID"
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+            />
+          </label>
+
+          {activeTab === 'business_establishment' && (
+            <label className="est-filter-item">
+              <span>Owner registration</span>
+              <select
+                value={ownerRegistrationFilter}
+                onChange={(event) => setOwnerRegistrationFilter(event.target.value)}
+              >
+                <option value="all">All owners ({ownerRegistrationCounts.all})</option>
+                <option value="registered">
+                  Registered owners ({ownerRegistrationCounts.registered})
+                </option>
+                <option value="unregistered">
+                  Unregistered owners ({ownerRegistrationCounts.unregistered})
+                </option>
+              </select>
+            </label>
+          )}
+
+          <div className="est-filter-actions">
+            <button
+              type="button"
+              className="ghost-cta"
+              onClick={() => {
+                setSearchQuery('');
+                setOwnerRegistrationFilter('all');
+              }}
+              disabled={!searchQuery && ownerRegistrationFilter === 'all'}
+            >
+              Clear filters
+            </button>
+          </div>
+        </div>
+
+        <div className="table-shell">
+          <div className="table-head table-grid accounts-grid">
+            <span>Name</span>
+            <span>Municipality</span>
+            <span>Role</span>
+            <span>Status</span>
+            <span>Activity</span>
+            <span>Actions</span>
+          </div>
+
+          <ul className="table-body">
+            {loadingStaff ? (
+              <li className="table-row table-grid">
+                <div className="muted">Loading accounts…</div>
+              </li>
+            ) : staffError ? (
+              <li className="table-row table-grid">
+                <div className="muted">{staffError}</div>
+              </li>
+            ) : filteredAccounts.length === 0 ? (
+              <li className="table-row table-grid">
+                <div className="muted">No accounts found for this filter.</div>
+              </li>
+            ) : (
+              paginatedAccounts.map((account) => (
+                <li key={account.id} className="table-row table-grid accounts-grid">
+                  <div className="account-cell">
+                    <p className="account-name">{account.name}</p>
+                    <p className="account-email">{account.email}</p>
+                  </div>
+                  <div className="muted">{account.municipality}</div>
+                  <div>
+                    <span className="role-chip">{account.role}</span>
+                  </div>
+                  <div>
+                    <span
+                      className={`status-chip status-${
+                        account.isActive ? 'success' : 'danger'
+                      }`}
+                    >
+                      {account.status}
+                    </span>
+                  </div>
+                  <div className="muted">
+                    <div>Last seen: {account.lastSeen}</div>
+                    <div>Updated: {formatDateTime(account.updatedAt)}</div>
+                  </div>
+                  <div className="table-actions">
+                    {account.roleId === 'lgu_admin' ? (
+                        <button
+                          type="button"
+                          className={`table-action-button ${
+                            account.isActive ? 'deactivate' : 'activate'
+                          }`}
+                          onClick={() =>
+                            openStatusModalForAccount(account, !account.isActive)
+                          }
+                          disabled={
+                            statusModal.loading &&
+                            statusModal.target?.id === account.id
+                          }
+                        >
+                          {account.isActive ? 'Deactivate' : 'Activate'}
+                        </button>
+                    ) : (
+                      <span className="muted">-</span>
+                    )}
+                  </div>
+                </li>
+              ))
+            )}
+          </ul>
+          
+        </div>
+
+        {isBtoStaffModalOpen && (
+            <div className="modal-backdrop" role="dialog" aria-modal="true">
+              <div className="modal-card">
+                <header className="modal-header">
+                  <div>
+                    <h3>Create BTO Staff</h3>
+                    <p>Create a BTO staff account with temporary credentials.</p>
+                  </div>
+                  <button
+                    type="button"
+                    className="modal-close"
+                    aria-label="Close"
+                    onClick={closeBtoStaffModal}
+                  >
+                    ×
+                  </button>
+                </header>
+
+                <div className="modal-content">
+                  <form className="modal-form" onSubmit={handleCreateBtoStaff}>
+                    <div className="form-row">
+                      <label className="form-label" htmlFor="bto-staff-fullName">
+                        Full name
+                      </label>
+                      <input
+                        id="bto-staff-fullName"
+                        name="fullName"
+                        type="text"
+                        required
+                        placeholder="Juan Dela Cruz"
+                        value={btoStaffForm.fullName}
+                        onChange={handleBtoStaffFormChange}
+                      />
+                    </div>
+
+                    <div className="form-row">
+                      <label className="form-label" htmlFor="bto-staff-username">
+                        Username
+                      </label>
+                      <input
+                        id="bto-staff-username"
+                        name="username"
+                        type="text"
+                        required
+                        placeholder="bto.staff001"
+                        value={btoStaffForm.username}
+                        onChange={handleBtoStaffFormChange}
+                      />
+                    </div>
+
+                    <div className="form-row">
+                      <label className="form-label" htmlFor="bto-staff-email">
+                        Email
+                      </label>
+                      <input
+                        id="bto-staff-email"
+                        name="email"
+                        type="email"
+                        required
+                        placeholder="staff@tourifybohol.gov.ph"
+                        value={btoStaffForm.email}
+                        onChange={handleBtoStaffFormChange}
+                      />
+                    </div>
+
+                    <div className="modal-actions">
+                      <button type="button" className="ghost-cta" onClick={closeBtoStaffModal}>
+                        Cancel
+                      </button>
+                      <button type="submit" className="primary-cta" disabled={submittingBtoStaff}>
+                        {submittingBtoStaff ? 'Creating…' : 'Create BTO Staff'}
+                      </button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+            </div>
+          )}
+
+        <div className="pagination-bar">
+          <div className="pagination-info">
+            Showing {filteredAccounts.length ? `${pageStart}–${pageEnd}` : '0'} of {filteredAccounts.length}
+          </div>
+          <div className="pagination-controls">
+            <button
+              type="button"
+              className="pagination-button"
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={page === 1 || !filteredAccounts.length}
+            >
+              Previous
+            </button>
+            <span className="pagination-page">Page {page} of {totalPages}</span>
+            <button
+              type="button"
+              className="pagination-button"
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={page === totalPages || !filteredAccounts.length}
+            >
+              Next
+            </button>
+          </div>
+        </div>
+      </section>
+
+      {isModalOpen && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true">
+          <div className="modal-card">
+            <header className="modal-header">
+              <div>
+                <h3>Invite LGU Administrator</h3>
+                <p>Send credentials so the LGU admin can activate their account.</p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                aria-label="Close"
+                onClick={closeModal}
+              >
+                ×
+              </button>
+            </header>
+
+            <div className="modal-content">
+              <form className="modal-form" onSubmit={handleCreateAdmin}>
+                <div className="form-row">
+                  <label className="form-label" htmlFor="admin-fullName">
+                    Full name
+                  </label>
+                  <input
+                    id="admin-fullName"
+                    name="fullName"
+                    type="text"
+                    required
+                    placeholder="Maria Cortez"
+                    value={adminForm.fullName}
+                    onChange={handleAdminFormChange}
+                  />
+                </div>
+
+                <div className="form-row form-grid">
+                  <div>
+                    <label className="form-label" htmlFor="admin-username">
+                      Username
+                    </label>
+                    <input
+                      id="admin-username"
+                      name="username"
+                      type="text"
+                      required
+                      placeholder="lgu.tagbilaran.admin"
+                      value={adminForm.username}
+                      onChange={handleAdminFormChange}
+                    />
+                  </div>
+                  <div>
+                    <label className="form-label" htmlFor="admin-email">
+                      Government email
+                    </label>
+                    <input
+                      id="admin-email"
+                      name="email"
+                      type="email"
+                      required
+                      placeholder="firstname.lastname@municipality.gov.ph"
+                      value={adminForm.email}
+                      onChange={handleAdminFormChange}
+                    />
+                  </div>
+                </div>
+
+                <div className="form-row">
+                  <label className="form-label" htmlFor="admin-municipality">
+                    Municipality assignment
+                  </label>
+                  <select
+                    id="admin-municipality"
+                    name="municipalityId"
+                    required
+                    value={adminForm.municipalityId}
+                    onChange={handleAdminFormChange}
+                    disabled={loadingMunicipalities || submittingAdmin}
+                  >
+                    <option value="" disabled>
+                      {loadingMunicipalities ? 'Loading municipalities…' : 'Select municipality'}
+                    </option>
+                    {!loadingMunicipalities &&
+                      (Array.isArray(municipalities) ? municipalities : []).map(
+                        (municipality) => (
+                          <option
+                            key={municipality.municipality_id || municipality.id}
+                            value={municipality.municipality_id || municipality.id}
+                          >
+                            {municipality.name}
+                          </option>
+                        ),
+                      )}
+                  </select>
+                </div>
+
+                <div className="modal-actions">
+                  <button type="button" className="ghost-cta" onClick={closeModal}>
+                    Cancel
+                  </button>
+                  <button type="submit" className="primary-cta" disabled={submittingAdmin}>
+                    {submittingAdmin ? 'Creating…' : 'Create LGU Admin'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {statusModal.open && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true">
+          <div className="modal-card">
+            <header className="modal-header">
+              <div>
+                <h3>
+                  {statusModal.nextState ? 'Reactivate LGU Admin' : 'Deactivate LGU Admin'}
+                </h3>
+                <p>
+                  {statusModal.nextState
+                    ? 'Allow this administrator to log back into the LGU portal.'
+                    : 'Immediately block access for this administrator.'}
+                  <br />
+                  <strong>{statusModal.target?.name}</strong>
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                aria-label="Close"
+                onClick={closeStatusModal}
+                disabled={statusModal.loading}
+              >
+                ×
+              </button>
+            </header>
+            {statusModal.error && <div className="modal-error">{statusModal.error}</div>}
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="ghost-cta"
+                onClick={closeStatusModal}
+                disabled={statusModal.loading}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className={statusModal.nextState ? 'primary-cta' : 'danger-cta'}
+                onClick={handleStatusSubmit}
+                disabled={statusModal.loading || statusActionBlocked}
+              >
+                {statusModal.loading
+                  ? 'Updating…'
+                  : statusModal.nextState
+                  ? 'Activate'
+                  : 'Deactivate'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+
+    </AdminLayout>
+  );
+}
+
+export default Accounts;
+
+
+
+
+
+
+
